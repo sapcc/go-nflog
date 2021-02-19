@@ -125,14 +125,14 @@ type HookFunc func(a Attribute) int
 // Register your own function as callback for a netfilter log group.
 // Errors other than net.Timeout() will be reported via the provided log interface
 // and the receiving of netfilter log messages will be stopped.
-func (nflog *Nflog) Register(ctx context.Context, fn HookFunc) error {
+func (nflog *Nflog) Register(ctx context.Context, fn HookFunc) (<-chan error, error) {
 
 	// unbinding existing handler (if any)
 	seq, err := nflog.setConfig(unix.AF_UNSPEC, 0, 0, []netlink.Attribute{
 		{Type: nfUlACfgCmd, Data: []byte{nfUlnlCfgCmdPfUnbind}},
 	})
 	if err != nil {
-		return fmt.Errorf("could not unbind existing handlers from socket: %v", err)
+		return nil, fmt.Errorf("could not unbind existing handlers from socket: %v", err)
 	}
 
 	// binding to family
@@ -140,7 +140,7 @@ func (nflog *Nflog) Register(ctx context.Context, fn HookFunc) error {
 		{Type: nfUlACfgCmd, Data: []byte{nfUlnlCfgCmdPfBind}},
 	})
 	if err != nil {
-		return fmt.Errorf("could not bind socket to family: %v", err)
+		return nil, fmt.Errorf("could not bind socket to family: %v", err)
 	}
 
 	if (nflog.settings & GenericGroup) == GenericGroup {
@@ -149,7 +149,7 @@ func (nflog *Nflog) Register(ctx context.Context, fn HookFunc) error {
 			{Type: nfUlACfgCmd, Data: []byte{nfUlnlCfgCmdPfBind}},
 		})
 		if err != nil {
-			return fmt.Errorf("could not bind to generic group: %v", err)
+			return nil, fmt.Errorf("could not bind to generic group: %v", err)
 		}
 	}
 
@@ -158,7 +158,7 @@ func (nflog *Nflog) Register(ctx context.Context, fn HookFunc) error {
 		{Type: nfUlACfgCmd, Data: []byte{nfUlnlCfgCmdBind}},
 	})
 	if err != nil {
-		return fmt.Errorf("could not bind to requested group %d: %v", nflog.group, err)
+		return nil, fmt.Errorf("could not bind to requested group %d: %v", nflog.group, err)
 	}
 
 	// set copy mode and buffer size
@@ -168,7 +168,7 @@ func (nflog *Nflog) Register(ctx context.Context, fn HookFunc) error {
 		{Type: nfUlACfgMode, Data: data},
 	})
 	if err != nil {
-		return fmt.Errorf("could not set copy mode %d and buffer size %d: %v", nflog.copyMode, nflog.bufsize, err)
+		return nil, fmt.Errorf("could not set copy mode %d and buffer size %d: %v", nflog.copyMode, nflog.bufsize, err)
 	}
 
 	var attrs []netlink.Attribute
@@ -191,9 +191,11 @@ func (nflog *Nflog) Register(ctx context.Context, fn HookFunc) error {
 	if len(attrs) != 0 {
 		_, err = nflog.setConfig(unix.AF_UNSPEC, seq, nflog.group, attrs)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
+
+	errChan := make(chan error)
 	go func() {
 		defer func() {
 			// unbinding from group
@@ -202,12 +204,16 @@ func (nflog *Nflog) Register(ctx context.Context, fn HookFunc) error {
 			})
 			if err != nil {
 				nflog.logger.Printf("Could not unbind socket from configuration: %v", err)
+				errChan <- err
+				close(errChan)
 				return
 			}
 		}()
 		for {
 			if err := ctx.Err(); err != nil {
 				nflog.logger.Printf("Stop receiving nflog messages: %v", err)
+				errChan <- err
+				close(errChan)
 				return
 			}
 			nflog.setReadTimeout()
@@ -219,6 +225,8 @@ func (nflog *Nflog) Register(ctx context.Context, fn HookFunc) error {
 					}
 				}
 				nflog.logger.Printf("Could not receive message: Unexpected error: %v", err)
+				errChan <- err
+				close(errChan)
 				return
 			}
 
@@ -234,13 +242,14 @@ func (nflog *Nflog) Register(ctx context.Context, fn HookFunc) error {
 					continue
 				}
 				if ret := fn(attrs); ret != 0 {
+					close(errChan)
 					return
 				}
 			}
 		}
 	}()
 
-	return nil
+	return errChan, nil
 }
 
 // /include/uapi/linux/netfilter/nfnetlink.h:struct nfgenmsg{}
